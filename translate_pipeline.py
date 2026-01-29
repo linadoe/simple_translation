@@ -60,7 +60,7 @@ def _call_llm(prompt: str, system_prompt: str, *,
     """
     _validate_localhost(llm_url)
 
-    endpoint = f"{llm_url.rstrip('/')}/v1/chat/completions"
+    endpoint = f"{llm_url.rstrip('/')}/api/chat"
 
     payload = json.dumps({
         "model": model,
@@ -68,7 +68,7 @@ def _call_llm(prompt: str, system_prompt: str, *,
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.1,
+        "options": {"temperature": 0.1},
         "stream": False,
     }).encode("utf-8")
 
@@ -92,9 +92,9 @@ def _call_llm(prompt: str, system_prompt: str, *,
             "Ist der lokale LLM-Server gestartet?"
         ) from exc
 
-    # OpenAI-kompatibles Antwortformat parsen
+    # Ollama-Antwortformat parsen
     try:
-        return body["choices"][0]["message"]["content"]
+        return body["message"]["content"]
     except (KeyError, IndexError) as exc:
         raise RuntimeError(
             f"Unerwartetes Antwortformat vom LLM-Server: {json.dumps(body, indent=2)}"
@@ -139,13 +139,26 @@ def _split_markdown_chunks(md_text: str, max_chars: int = MAX_CHUNK_CHARS) -> li
 # Übersetzung
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_MD = (
     "You are a professional translator. Translate the following Markdown text "
     "into English. Preserve ALL Markdown formatting exactly as-is: headings (#), "
     "bold (**), italic (*), links, tables, lists, code blocks, etc. "
     "Only translate the human-readable text content. "
     "Do NOT add any commentary, explanations, or notes — return ONLY the "
     "translated Markdown."
+)
+
+# Alias for backwards compatibility
+SYSTEM_PROMPT = SYSTEM_PROMPT_MD
+
+SYSTEM_PROMPT_DOCX = (
+    "You are a professional translator. You will receive numbered lines of text "
+    "extracted from a Word document. Translate each line into English. "
+    "Return EXACTLY the same number of lines, each prefixed with the same "
+    "number and pipe separator as the input (e.g. '1|translated text'). "
+    "Keep empty lines as empty (e.g. '3|'). "
+    "Do NOT add any commentary, explanations, or notes — return ONLY the "
+    "translated lines in the exact format described."
 )
 
 
@@ -181,7 +194,217 @@ def translate_markdown(md_text: str, *,
 
 
 # ---------------------------------------------------------------------------
-# Haupt-Pipeline
+# DOCX-Übersetzung
+# ---------------------------------------------------------------------------
+
+def _collect_docx_paragraphs(doc) -> list:
+    """
+    Sammelt alle Absätze aus dem Dokument-Body und aus Tabellenzellen.
+    Gibt eine Liste von python-docx Paragraph-Objekten zurück.
+    """
+    paragraphs = list(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraphs.append(paragraph)
+    return paragraphs
+
+
+def _chunk_paragraphs(texts: list[str], max_chars: int = MAX_CHUNK_CHARS) -> list[list[int]]:
+    """
+    Gruppiert Absatz-Indizes in Chunks, sodass die Gesamtzeichenzahl pro Chunk
+    *max_chars* nicht überschreitet (sofern ein einzelner Absatz nicht schon
+    länger ist).
+
+    Returns:
+        Liste von Listen mit Absatz-Indizes.
+    """
+    chunks: list[list[int]] = []
+    current_chunk: list[int] = []
+    current_len = 0
+
+    for idx, text in enumerate(texts):
+        # Formatierte Zeile: "idx|text\n" — Overhead einrechnen
+        line_len = len(f"{idx}|{text}\n")
+        if current_chunk and current_len + line_len > max_chars:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(idx)
+        current_len += line_len
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _translate_paragraph_chunk(
+    indices: list[int],
+    texts: list[str],
+    *,
+    llm_url: str,
+    model: str,
+) -> dict[int, str]:
+    """
+    Übersetzt einen Chunk von Absätzen via LLM.
+    Gibt ein dict {index: übersetzter_text} zurück.
+    """
+    # Nummeriertes Format aufbauen
+    lines = [f"{i}|{texts[i]}" for i in indices]
+    prompt = "\n".join(lines)
+
+    raw = _call_llm(
+        prompt=prompt,
+        system_prompt=SYSTEM_PROMPT_DOCX,
+        llm_url=llm_url,
+        model=model,
+    )
+
+    # Antwort parsen: "idx|übersetzter Text"
+    result: dict[int, str] = {}
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            key, _, value = line.partition("|")
+            try:
+                result[int(key.strip())] = value
+            except ValueError:
+                continue
+
+    return result
+
+
+def _replace_paragraph_text(paragraph, new_text: str) -> None:
+    """
+    Ersetzt den Text eines Absatzes unter Beibehaltung der Formatierung.
+
+    - Ein Run: Text direkt ersetzen (Format bleibt komplett erhalten).
+    - Mehrere Runs: Übersetzung in den ersten Run, restliche leeren.
+    """
+    runs = paragraph.runs
+    if not runs:
+        return
+    if len(runs) == 1:
+        runs[0].text = new_text
+    else:
+        runs[0].text = new_text
+        for run in runs[1:]:
+            run.text = ""
+
+
+def translate_docx(
+    input_file: str,
+    output_file: str | None = None,
+    *,
+    llm_url: str = DEFAULT_LLM_URL,
+    model: str = DEFAULT_MODEL,
+) -> str:
+    """
+    Übersetzt eine .docx-Datei ins Englische und speichert das Ergebnis
+    als neue .docx-Datei. Word-Formatierung (Styles, Schriftarten, Tabellen)
+    wird beibehalten.
+
+    Args:
+        input_file:   Pfad zur Eingabedatei (.docx).
+        output_file:  Pfad für die übersetzte .docx-Datei.
+                      Standard: <input>_en.docx
+        llm_url:      Basis-URL des lokalen LLM-Servers.
+        model:        Modellname des LLM.
+
+    Returns:
+        Pfad zur erzeugten Ausgabedatei.
+    """
+    from docx import Document
+
+    _validate_localhost(llm_url)
+
+    input_path = Path(input_file)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {input_path}")
+
+    if input_path.suffix.lower() != ".docx":
+        raise ValueError(
+            f"Nicht unterstütztes Dateiformat: '{input_path.suffix}'. "
+            "translate_docx erwartet eine .docx-Datei."
+        )
+
+    # --- Dokument öffnen ---
+    print("=" * 60)
+    print("DOCX-Übersetzung: Dokument wird geladen")
+    print("=" * 60)
+    doc = Document(str(input_path))
+
+    # --- Alle Absätze sammeln ---
+    all_paragraphs = _collect_docx_paragraphs(doc)
+    texts = [p.text for p in all_paragraphs]
+
+    # Nur nicht-leere Absätze übersetzen
+    non_empty_indices = [i for i, t in enumerate(texts) if t.strip()]
+    print(f"  {len(all_paragraphs)} Absätze gefunden, "
+          f"davon {len(non_empty_indices)} nicht-leer.")
+
+    if not non_empty_indices:
+        print("  Keine übersetzbaren Absätze gefunden.")
+    else:
+        # --- Chunking ---
+        non_empty_texts = [texts[i] for i in non_empty_indices]
+        # _chunk_paragraphs arbeitet auf lokalen Indizes,
+        # wir müssen sie auf die non_empty_indices abbilden.
+        local_chunks = _chunk_paragraphs(non_empty_texts)
+        total_chunks = len(local_chunks)
+
+        print(f"  Aufgeteilt in {total_chunks} Chunk(s).\n")
+        print("=" * 60)
+        print("Übersetzung via lokalem LLM")
+        print(f"  Server: {llm_url}")
+        print(f"  Modell: {model}")
+        print("=" * 60)
+
+        # --- Übersetzen ---
+        translated_map: dict[int, str] = {}  # global index -> übersetzter Text
+        for chunk_idx, local_indices in enumerate(local_chunks, start=1):
+            print(f"  Übersetze Chunk {chunk_idx}/{total_chunks} "
+                  f"({len(local_indices)} Absätze) ...")
+
+            # Globale Indizes für diesen Chunk
+            global_indices = [non_empty_indices[li] for li in local_indices]
+            result = _translate_paragraph_chunk(
+                global_indices, texts,
+                llm_url=llm_url, model=model,
+            )
+            translated_map.update(result)
+
+        # --- Übersetzungen zurückschreiben ---
+        replaced = 0
+        for idx in non_empty_indices:
+            if idx in translated_map:
+                _replace_paragraph_text(all_paragraphs[idx], translated_map[idx])
+                replaced += 1
+
+        print(f"\n  {replaced}/{len(non_empty_indices)} Absätze übersetzt "
+              f"und zurückgeschrieben.")
+
+    # --- Speichern ---
+    if output_file is None:
+        output_path = input_path.with_name(input_path.stem + "_en.docx")
+    else:
+        output_path = Path(output_file)
+
+    doc.save(str(output_path))
+
+    print("\n" + "=" * 60)
+    print(f"Übersetzung abgeschlossen: {output_path}")
+    print("=" * 60)
+
+    return str(output_path)
+
+
+# ---------------------------------------------------------------------------
+# Haupt-Pipeline (Markdown)
 # ---------------------------------------------------------------------------
 
 def translate_document(
