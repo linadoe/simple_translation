@@ -27,15 +27,11 @@ pip install pypandoc
 pip install python-docx
 ```
 
-Falls keine dieser Bibliotheken installiert ist, wird eine einfache Text-Extraktion als Fallback verwendet.
-
 ### Lokaler LLM-Server
 
-Ein lokaler LLM-Server muss laufen und mit der OpenAI-API kompatibel sein. Beispiele:
+Ein lokaler LLM-Server muss laufen. Beispiel:
 
 - [Ollama](https://ollama.ai/)
-- [vLLM](https://github.com/vllm-project/vllm)
-- [llama.cpp Server](https://github.com/ggerganov/llama.cpp)
 
 Standardmäßig wird `http://localhost:11435` verwendet.
 
@@ -117,36 +113,6 @@ Die Pipeline ist so konzipiert, dass alle Daten lokal bleiben:
 - Nur localhost-Verbindungen zum LLM-Server sind erlaubt
 - Keine externen API-Aufrufe
 - Keine Cloud-Dienste
-
-## Fehlerbehebung
-
-### "Kein LLM-Server erreichbar"
-
-Stellen Sie sicher, dass Ihr lokaler LLM-Server läuft:
-
-```bash
-# Für Ollama
-ollama serve
-
-# Überprüfen Sie die Erreichbarkeit
-curl http://localhost:11435/v1/models
-```
-
-### "Keine Konvertierungsmethode verfügbar"
-
-Installieren Sie mindestens eine der Konvertierungsbibliotheken:
-
-```bash
-pip install mammoth
-```
-
-### Formatierungsprobleme
-
-Versuchen Sie eine andere Konvertierungsmethode:
-
-```bash
-python translate_pipeline.py dokument.docx --method pypandoc
-```
 
 ## Lizenz
 
